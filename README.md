@@ -52,11 +52,14 @@ curl -sfL https://raw.githubusercontent.com/Changroro/lport/main/install.sh | sh
 cargo install --git https://github.com/Changroro/lport
 ```
 
+Shell completions ship in [`completions/`](completions) (bash / zsh / fish) — copy the matching file to your shell's completion directory.
+
 ## Usage
 
 ```bash
 lport                    # dashboard: user servers + docker containers
 lport --dev              # everything (system daemons included)
+lport --sort mem         # sort rows by port|pid|process|cpu|mem|uptime
 lport 8080               # shorthand for `lport info 8080`
 lport info 8080          # detail block for a single port
 lport info 8080 5432     # multiple ports
@@ -72,7 +75,7 @@ sudo lport               # full visibility into other users' processes
   <img src="demo/dashboard.gif" alt="lport dashboard" width="780"/>
 </p>
 
-The default view groups Docker containers by their `com.docker.compose.project` label (falling back to the container name), so sibling containers of the same compose project read as one `[ project ]` block. Local rows show the full working directory in the `JOB` column with `$HOME` abbreviated to `~`. The column is **never truncated** — losing the path would defeat the feature — and column widths account for CJK and emoji display width, so a path like `~/프로젝트/데모` keeps the table aligned.
+The default view groups Docker containers by their `com.docker.compose.project` label (falling back to the container name), so sibling containers of the same compose project read as one `[ project ]` block. The `ADDR` column shows the bind address (`127.0.0.1` vs `0.0.0.0` matters — one is exposed to the network), with multiple binds comma-separated (`0.0.0.0, ::`). Local rows show the full working directory in the `JOB` column with `$HOME` abbreviated to `~`. Columns are **never truncated** — losing the path would defeat the feature — and column widths account for CJK and emoji display width, so a path like `~/프로젝트/데모` keeps the table aligned. `--sort KEY` (port, pid, process, cpu, mem, uptime) reorders rows globally — cpu/mem/uptime put the largest first — and disables the `[ project ]` headers, since sorted rows are no longer grouped.
 
 ### Detail view
 
@@ -118,17 +121,17 @@ Exit codes survive closed pipes: `lport kill -y 3000 8080 | head -1` still signa
 
 On **Linux**:
 
-- `ss -tlnpH` and `ss -ulnpH` for TCP/UDP listening sockets (a failing `ss` is reported loudly, never as "no ports")
-- `/proc/<pid>/{cwd,cmdline,stat,exe}` read directly — no extra process spawn
+- `ss -tulnpH` — one call for TCP+UDP listening sockets (the Netid column tells them apart); a failing `ss` is reported loudly, never as "no ports"
+- `/proc/<pid>/{cwd,stat,exe}` read directly — no extra process spawn. The default dashboard reads only `stat`+`exe` for every listener (to decide "user-launched?") and `cwd` just for the rows it keeps; `cmdline` is read in `info` mode only
 - `ps -o pid=,pcpu=,rss=,nlwp=,etime=,user=` (one batched call) for CPU / MEM / uptime / user
 - kill verification polls `/proc/<pid>/stat` — zombies count as exited, their sockets are already released
 
 On **macOS**:
 
 - `lsof -nP -iTCP -sTCP:LISTEN` and `lsof -nP -iUDP` for TCP/UDP listening sockets
-- `lsof -a -p <pids> -d cwd` (one batched call) for each process's working directory
-- `ps -o pid=,tty=,comm=` (pass 1) for TTY + executable basename
-- `ps -o pid=,command=` (pass 2) for the full command line
+- `ps -o pid=,tty=,comm=` (one batched call) for TTY + executable basename — the default dashboard stops here and filters on it
+- `lsof -a -p <pids> -d cwd` (one batched call) for each surviving process's working directory
+- `ps -o pid=,command=` (info mode only) for the full command line
 - `ps -o pid=,pcpu=,rss=,etime=,user=` for CPU / MEM / uptime / user
 - kill verification polls `ps -o stat=` — not `kill -0`, which mistakes zombies for live processes
 

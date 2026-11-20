@@ -2,6 +2,8 @@
 name = "lport"
 version = "0.9.0"
 edition = "2024"
+# edition 2024 needs 1.85; the let-chains used in the source need 1.88.
+rust-version = "1.88"
 description = "List listening ports with the folder each server was launched from."
 license = "MIT"
 repository = "https://github.com/Changroro/lport"

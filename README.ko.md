@@ -52,11 +52,14 @@ curl -sfL https://raw.githubusercontent.com/Changroro/lport/main/install.sh | sh
 cargo install --git https://github.com/Changroro/lport
 ```
 
+셸 자동완성은 [`completions/`](completions)(bash / zsh / fish)에 들어 있습니다 — 사용하는 셸의 완성 디렉터리에 해당 파일을 복사하세요.
+
 ## 사용법
 
 ```bash
 lport                    # 대시보드: 사용자 서버 + docker 컨테이너
 lport --dev              # 전부 (시스템 데몬 포함)
+lport --sort mem         # 행을 port|pid|process|cpu|mem|uptime 순으로 정렬
 lport 8080               # `lport info 8080` 단축
 lport info 8080          # 단일 포트 상세 블록
 lport info 8080 5432     # 여러 포트
@@ -72,7 +75,7 @@ sudo lport               # 다른 사용자 프로세스까지 완전한 가시�
   <img src="demo/dashboard.gif" alt="lport dashboard" width="780"/>
 </p>
 
-기본 뷰는 Docker 컨테이너를 `com.docker.compose.project` 라벨로 묶어(없으면 컨테이너 이름) 같은 compose 프로젝트의 형제 컨테이너들이 하나의 `[ project ]` 블록으로 읽히게 합니다. 로컬 행은 `JOB` 컬럼에 전체 작업 디렉터리를 보여주며 `$HOME`은 `~`로 줄입니다. 이 컬럼은 **절대 잘리지 않습니다** — 경로를 잃으면 이 도구의 존재 이유가 사라지니까요. 컬럼 너비는 한글·이모지의 터미널 표시 폭까지 계산하므로 `~/프로젝트/데모` 같은 경로에서도 표가 흐트러지지 않습니다.
+기본 뷰는 Docker 컨테이너를 `com.docker.compose.project` 라벨로 묶어(없으면 컨테이너 이름) 같은 compose 프로젝트의 형제 컨테이너들이 하나의 `[ project ]` 블록으로 읽히게 합니다. `ADDR` 컬럼은 바인드 주소를 보여주고(`127.0.0.1`과 `0.0.0.0`의 차이는 중요합니다 — 하나는 네트워크에 노출됨), 여러 주소에 바인드된 경우 콤마로 나열합니다(`0.0.0.0, ::`). 로컬 행은 `JOB` 컬럼에 전체 작업 디렉터리를 보여주며 `$HOME`은 `~`로 줄입니다. 컬럼은 **절대 잘리지 않습니다** — 경로를 잃으면 이 도구의 존재 이유가 사라지니까요. 컬럼 너비는 한글·이모지의 터미널 표시 폭까지 계산하므로 `~/프로젝트/데모` 같은 경로에서도 표가 흐트러지지 않습니다. `--sort KEY`(port, pid, process, cpu, mem, uptime)는 행을 전역으로 재정렬합니다 — cpu/mem/uptime은 큰 값이 먼저 — 정렬된 행은 더 이상 묶여 있지 않으므로 `[ project ]` 헤더는 비활성화됩니다.
 
 ### 상세 보기
 
@@ -118,17 +121,17 @@ Exit code는 파이프가 닫혀도 유지됩니다: `lport kill -y 3000 8080 | 
 
 **Linux**:
 
-- `ss -tlnpH` / `ss -ulnpH`로 TCP/UDP 리스닝 소켓 수집 (`ss` 실패는 "포트 없음"이 아니라 명확한 에러로 보고)
-- `/proc/<pid>/{cwd,cmdline,stat,exe}`를 직접 읽음 — 추가 프로세스 스폰 없음
+- `ss -tulnpH` **한 번**으로 TCP+UDP 리스닝 소켓 수집 (Netid 컬럼이 둘을 구분) — `ss` 실패는 "포트 없음"이 아니라 명확한 에러로 보고
+- `/proc/<pid>/{cwd,stat,exe}`를 직접 읽음 — 추가 프로세스 스폰 없음. 기본 대시보드는 모든 리스너에 대해 `stat`+`exe`만 읽어 "사용자가 띄운 것인지"를 판단하고, 유지되는 행에만 `cwd`를 읽음. `cmdline`은 `info` 모드에서만 읽음
 - `ps -o pid=,pcpu=,rss=,nlwp=,etime=,user=` (배치 1회)로 CPU / MEM / 가동 시간 / 사용자
 - kill 검증은 `/proc/<pid>/stat` 폴링 — 좀비는 이미 소켓을 놓았으므로 종료로 취급
 
 **macOS**:
 
 - `lsof -nP -iTCP -sTCP:LISTEN` / `lsof -nP -iUDP`로 TCP/UDP 리스닝 소켓 수집
-- `lsof -a -p <pids> -d cwd` (배치 1회)로 각 프로세스의 작업 디렉터리
-- `ps -o pid=,tty=,comm=` (1차)로 TTY + 실행파일 이름
-- `ps -o pid=,command=` (2차)로 전체 커맨드라인
+- `ps -o pid=,tty=,comm=` (배치 1회)로 TTY + 실행파일 이름 — 기본 대시보드는 여기까지 읽고 필터링
+- `lsof -a -p <pids> -d cwd` (배치 1회)로 유지된 프로세스들의 작업 디렉터리
+- `ps -o pid=,command=` (`info` 모드 전용)으로 전체 커맨드라인
 - `ps -o pid=,pcpu=,rss=,etime=,user=`로 CPU / MEM / 가동 시간 / 사용자
 - kill 검증은 `ps -o stat=` 폴링 — `kill -0`은 좀비를 살아있다고 오판하므로 쓰지 않음
 

@@ -31,6 +31,11 @@ struct Stats {
     cpu: String,
     mem: String,
     uptime: String,
+    // Raw values behind the display strings, used by --sort.
+    // None when unknown (e.g. docker rows outside info mode, foreign processes).
+    cpu_pct: Option<f64>,
+    mem_bytes: Option<u64>,
+    uptime_secs: Option<u64>,
     threads: Option<u32>,
     user: Option<String>,
 }
@@ -71,10 +76,27 @@ struct Entry {
     user_launched: bool,
 }
 
+#[derive(Debug, PartialEq)]
 enum Mode {
     Dashboard { dev: bool },
     Info { ports: Vec<u32> },
     Kill { ports: Vec<u32>, force: bool, yes: bool },
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum SortKey {
+    Port,
+    Pid,
+    Process,
+    Cpu,
+    Mem,
+    Uptime,
+}
+
+#[derive(Debug, PartialEq)]
+struct Cli {
+    mode: Mode,
+    sort: Option<SortKey>,
 }
 
 fn main() {
@@ -93,7 +115,13 @@ fn main() {
         return;
     }
 
-    let mode = parse_mode(&args);
+    let cli = match parse_args(&args) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(2);
+        }
+    };
     let docker_map = load_docker_ports();
 
     let mut entries = collect_listening(&docker_map, true);
@@ -132,50 +160,63 @@ fn main() {
     });
 
     // Info / Kill modes are single-port queries, so filter before the per-PID
-    // enrich step. Otherwise `lport info 8080` pays the cost of reading /proc
+    // enrich steps. Otherwise `lport info 8080` pays the cost of reading /proc
     // (or calling ps/lsof) for every listener on the box.
-    match &mode {
-        Mode::Info { ports } | Mode::Kill { ports, .. } => {
-            entries.retain(|e| ports.contains(&e.port));
-        }
-        _ => {}
+    if let Mode::Info { ports } | Mode::Kill { ports, .. } = &cli.mode {
+        entries.retain(|e| ports.contains(&e.port));
     }
 
-    enrich_process_info(&mut entries);
+    // Pass 1 (cheap, every listener): tty + exe only, to decide user_launched.
+    // The default dashboard filters on this, so it must run before the filter.
+    enrich_user_launched(&mut entries);
 
-    if let Mode::Kill { ports, force, yes } = &mode {
+    if let Mode::Dashboard { dev: false } = &cli.mode {
+        entries.retain(|e| e.docker.is_some() || e.user_launched);
+    }
+
+    // Pass 2: cwd for the rows that survived the filter (dashboard JOB column,
+    // kill prompt identity, info CWD row). Reading cwd for every system daemon
+    // just to hide it again in the default view is wasted work.
+    enrich_cwd(&mut entries);
+
+    if let Mode::Kill { ports, force, yes } = &cli.mode {
         let code = run_kill(&entries, ports, *force, *yes, &docker_map);
         maybe_print_update_notice();
         std::process::exit(code);
     }
 
-    if let Mode::Dashboard { dev: false } = &mode {
-        entries.retain(|e| e.docker.is_some() || e.user_launched);
-    }
-
-    // Sort by visual group key (compose project if present, else container
-    // name for docker, else cwd for local), then container name for
-    // determinism within a group, then port/proto.
-    entries.sort_by(|a, b| {
-        let group_a = group_key(a);
-        let group_b = group_key(b);
-        let name_a = a.docker.as_ref().map(|d| d.name.as_str()).unwrap_or("");
-        let name_b = b.docker.as_ref().map(|d| d.name.as_str()).unwrap_or("");
-        (group_a, name_a, a.port, a.proto).cmp(&(group_b, name_b, b.port, b.proto))
-    });
-
     enrich_local_stats(&mut entries);
-    let with_docker_cpu_mem = matches!(mode, Mode::Info { .. });
+    let with_docker_cpu_mem = matches!(cli.mode, Mode::Info { .. });
     enrich_docker_stats(&mut entries, with_docker_cpu_mem);
 
-    match mode {
+    // Sort AFTER the stats passes: --sort cpu/mem/uptime reads the raw Stats
+    // values, which are only populated above. Default order is by visual group
+    // key (compose project if present, else container name for docker, else cwd
+    // for local), then container name for determinism within a group, then
+    // port/proto — keeps docker [ project ] blocks adjacent. `--sort KEY`
+    // replaces this with a global row sort.
+    match cli.sort {
+        Some(key) => sort_entries(&mut entries, key),
+        None => entries.sort_by(|a, b| {
+            let group_a = group_key(a);
+            let group_b = group_key(b);
+            let name_a = a.docker.as_ref().map(|d| d.name.as_str()).unwrap_or("");
+            let name_b = b.docker.as_ref().map(|d| d.name.as_str()).unwrap_or("");
+            (group_a, name_a, a.port, a.proto).cmp(&(group_b, name_b, b.port, b.proto))
+        }),
+    }
+
+    match &cli.mode {
         Mode::Info { ports } => {
+            // cmdline + parent are info-only: the dashboard never displays them,
+            // so paying for them on every run would be pure waste.
+            enrich_cmdline(&mut entries);
             enrich_parent_info(&mut entries);
-            let code = print_info(&entries, &ports);
+            let code = print_info(&entries, ports);
             maybe_print_update_notice();
             std::process::exit(code);
         }
-        Mode::Dashboard { dev } => print_table(&entries, dev),
+        Mode::Dashboard { dev } => print_table(&entries, *dev, cli.sort.is_none()),
         // Kill mode already exited via `run_kill` above; this arm exists only
         // to satisfy exhaustiveness.
         Mode::Kill { .. } => unreachable!(),
@@ -185,14 +226,17 @@ fn main() {
 }
 
 fn print_help() {
-    println!("Usage: lport [--dev]");
+    println!("Usage: lport [--dev] [--sort KEY]");
     println!("       lport PORT [PORT ...]");
     println!("       lport info PORT [PORT ...]");
     println!("       lport kill PORT [PORT ...] [-9|--force] [-y|--yes]");
     println!();
     println!("  (default)        Show user-launched servers and Docker containers only");
-    println!("                   (PROTO PORT PID PROCESS JOB CPU MEM UPTIME)");
+    println!("                   (PROTO PORT ADDR PID PROCESS JOB CPU MEM UPTIME)");
     println!("  --dev            Show every listening port, including system daemons");
+    println!("  --sort KEY       Sort dashboard rows by KEY: port, pid, process, cpu, mem,");
+    println!("                   uptime (cpu/mem/uptime largest first; disables the docker");
+    println!("                   [ project ] group headers)");
     println!("  PORT...          Shorthand for `lport info PORT...`");
     println!("  info PORT...     Show full details for the given port(s),");
     println!("                   including Docker container CPU/MEM");
@@ -773,7 +817,49 @@ fn warn_on_restart(
     }
 }
 
-fn parse_mode(args: &[String]) -> Mode {
+const SORT_KEYS_HINT: &str = "port, pid, process, cpu, mem, uptime";
+
+// Split the global flag `--sort KEY` out of the argument list first, so it may
+// appear in any position (`lport --sort mem`, `lport --dev --sort mem`).
+// What remains is parsed as before.
+fn parse_args(args: &[String]) -> Result<Cli, String> {
+    let mut sort = None;
+    let mut rest: Vec<String> = Vec::with_capacity(args.len());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--sort" => {
+                let Some(key) = it.next() else {
+                    return Err(format!("--sort requires a key ({})", SORT_KEYS_HINT));
+                };
+                sort = Some(match key.as_str() {
+                    "port" => SortKey::Port,
+                    "pid" => SortKey::Pid,
+                    "process" => SortKey::Process,
+                    "cpu" => SortKey::Cpu,
+                    "mem" => SortKey::Mem,
+                    "uptime" => SortKey::Uptime,
+                    _ => {
+                        return Err(format!(
+                            "invalid sort key '{}' (expected {})",
+                            key, SORT_KEYS_HINT
+                        ));
+                    }
+                });
+            }
+            _ => rest.push(a.clone()),
+        }
+    }
+    let mode = parse_mode(&rest)?;
+    if let Mode::Kill { .. } = &mode
+        && sort.is_some()
+    {
+        return Err("--sort cannot be used with kill".to_string());
+    }
+    Ok(Cli { mode, sort })
+}
+
+fn parse_mode(args: &[String]) -> Result<Mode, String> {
     // A subcommand is only a subcommand in first position. Matching it anywhere
     // turns `lport kill 8080 info` into "unknown argument 'kill'" instead of the
     // real complaint, which is the stray `info`.
@@ -788,22 +874,18 @@ fn parse_mode(args: &[String]) -> Mode {
         .is_some_and(|p| (1..=65535).contains(&p));
 
     if subcommand == Some("info") || shorthand_info {
-        let port_args = if shorthand_info { &args[..] } else { &args[1..] };
+        let port_args = if shorthand_info { args } else { &args[1..] };
         let mut ports: Vec<u32> = Vec::new();
         for a in port_args {
             match a.parse::<u32>() {
                 Ok(p) if (1..=65535).contains(&p) => ports.push(p),
-                _ => {
-                    eprintln!("error: invalid port '{}'", a);
-                    std::process::exit(2);
-                }
+                _ => return Err(format!("invalid port '{}'", a)),
             }
         }
         if ports.is_empty() {
-            eprintln!("error: 'lport info' requires at least one port number.");
-            std::process::exit(2);
+            return Err("'lport info' requires at least one port number.".to_string());
         }
-        return Mode::Info { ports };
+        return Ok(Mode::Info { ports });
     }
 
     if subcommand == Some("kill") {
@@ -816,31 +898,60 @@ fn parse_mode(args: &[String]) -> Mode {
                 "-y" | "--yes" => yes = true,
                 _ => match a.parse::<u32>() {
                     Ok(p) if (1..=65535).contains(&p) => ports.push(p),
-                    _ => {
-                        eprintln!("error: invalid port '{}'", a);
-                        std::process::exit(2);
-                    }
+                    _ => return Err(format!("invalid port '{}'", a)),
                 },
             }
         }
         if ports.is_empty() {
-            eprintln!("error: 'lport kill' requires at least one port number.");
-            std::process::exit(2);
+            return Err("'lport kill' requires at least one port number.".to_string());
         }
-        return Mode::Kill { ports, force, yes };
+        return Ok(Mode::Kill { ports, force, yes });
     }
 
     let mut dev = false;
     for a in args {
         match a.as_str() {
             "--dev" => dev = true,
-            _ => {
-                eprintln!("error: unknown argument '{}'", a);
-                std::process::exit(2);
-            }
+            _ => return Err(format!("unknown argument '{}'", a)),
         }
     }
-    Mode::Dashboard { dev }
+    Ok(Mode::Dashboard { dev })
+}
+
+// Global row sort for `--sort KEY`. port/pid/process ascend; cpu/mem/uptime put
+// the largest first (the "who is eating my machine" question), unknowns last.
+fn sort_entries(entries: &mut [Entry], key: SortKey) {
+    entries.sort_by(|a, b| {
+        match key {
+            SortKey::Port => a.port.cmp(&b.port).then_with(|| a.proto.cmp(b.proto)),
+            SortKey::Pid => cmp_opt(a.pid, b.pid, false).then_with(|| a.port.cmp(&b.port)),
+            SortKey::Process => a
+                .process
+                .cmp(&b.process)
+                .then_with(|| a.port.cmp(&b.port)),
+            SortKey::Cpu => cmp_opt(a.stats.cpu_pct, b.stats.cpu_pct, true)
+                .then_with(|| a.port.cmp(&b.port)),
+            SortKey::Mem => cmp_opt(a.stats.mem_bytes, b.stats.mem_bytes, true)
+                .then_with(|| a.port.cmp(&b.port)),
+            SortKey::Uptime => cmp_opt(a.stats.uptime_secs, b.stats.uptime_secs, true)
+                .then_with(|| a.port.cmp(&b.port)),
+        }
+    });
+}
+
+// Option comparison: Some < None always (unknowns last), direction flips the
+// value order for `desc`.
+fn cmp_opt<T: PartialOrd>(a: Option<T>, b: Option<T>, desc: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            let ord = x.partial_cmp(&y).unwrap_or(Ordering::Equal);
+            if desc { ord.reverse() } else { ord }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
 }
 
 fn is_interpreter_exe(name: &str) -> bool {
@@ -1035,14 +1146,15 @@ fn parse_port_range(s: &str) -> Option<(u32, u32)> {
 #[cfg(target_os = "linux")]
 fn collect_listening(docker_map: &DockerMap, strict: bool) -> Vec<Entry> {
     let mut entries = Vec::new();
-    collect_ss("tcp", &["-tlnpH"], docker_map, &mut entries, strict);
-    collect_ss("udp", &["-ulnpH"], docker_map, &mut entries, strict);
+    // One `ss` invocation for both stacks instead of two. With -tul combined the
+    // Netid column appears ("tcp"/"udp" in field 0) and the local address moves
+    // from field 3 to field 4 — parse_ss_line reads the proto from the line.
+    collect_ss(&["-tulnpH"], docker_map, &mut entries, strict);
     entries
 }
 
 #[cfg(target_os = "linux")]
 fn collect_ss(
-    proto: &'static str,
     args: &[&str],
     docker_map: &DockerMap,
     out: &mut Vec<Entry>,
@@ -1079,22 +1191,27 @@ fn collect_ss(
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
-        parse_ss_line(line, proto, docker_map, out);
+        parse_ss_line(line, docker_map, out);
     }
 }
 
 #[cfg(target_os = "linux")]
 fn parse_ss_line(
     line: &str,
-    proto: &'static str,
     docker_map: &DockerMap,
     out: &mut Vec<Entry>,
 ) {
     let fields: Vec<&str> = line.split_whitespace().collect();
-    if fields.len() < 4 {
+    // Netid State Recv-Q Send-Q Local Peer [users]
+    if fields.len() < 5 {
         return;
     }
-    let local = fields[3];
+    let proto: &'static str = match fields[0] {
+        "tcp" => "tcp",
+        "udp" => "udp",
+        _ => return,
+    };
+    let local = fields[4];
     let Some(port_str) = local.rsplit(':').next() else {
         return;
     };
@@ -1303,38 +1420,76 @@ fn flush_lsof(
 // CWD / cmdline / user-launched detection (platform-specific)
 // ================================================================
 
+// Pass 1: user_launched only (tty + exe basename). The default dashboard filters
+// on this, so it must cover every listener — but it costs just the two cheapest
+// /proc reads per PID, not the full cwd/cmdline set.
 #[cfg(target_os = "linux")]
-fn enrich_process_info(entries: &mut [Entry]) {
+fn enrich_user_launched(entries: &mut [Entry]) {
+    let pids: HashSet<u32> = entries.iter().filter_map(|e| e.pid).collect();
+    if pids.is_empty() {
+        return;
+    }
+    let mut map: HashMap<u32, bool> = HashMap::with_capacity(pids.len());
+    for pid in &pids {
+        map.insert(*pid, read_user_launched_proc(*pid));
+    }
+    for e in entries.iter_mut() {
+        if let Some(pid) = e.pid
+            && let Some(&launched) = map.get(&pid)
+        {
+            e.user_launched = launched;
+        }
+    }
+}
+
+// Pass 2: cwd, read once per PID (a reverse proxy listens on many ports; reading
+// per-entry would repeat the syscalls). Runs after the default-mode filter, so
+// only surviving rows pay for it.
+#[cfg(target_os = "linux")]
+fn enrich_cwd(entries: &mut [Entry]) {
     for e in entries.iter_mut() {
         if e.pid.is_none() {
             e.cwd = "-".to_string();
+        }
+    }
+    let pids: HashSet<u32> = entries.iter().filter_map(|e| e.pid).collect();
+    if pids.is_empty() {
+        return;
+    }
+    let mut map: HashMap<u32, String> = HashMap::with_capacity(pids.len());
+    for pid in &pids {
+        map.insert(*pid, read_cwd_proc(*pid));
+    }
+    for e in entries.iter_mut() {
+        if let Some(pid) = e.pid
+            && let Some(cwd) = map.get(&pid)
+        {
+            e.cwd = cwd.clone();
+        }
+    }
+}
+
+// Pass 3 (info mode only): full cmdline. The dashboard never displays it.
+#[cfg(target_os = "linux")]
+fn enrich_cmdline(entries: &mut [Entry]) {
+    for e in entries.iter_mut() {
+        if e.pid.is_none() {
             e.cmdline = "-".to_string();
         }
     }
-
-    let unique_pids: HashSet<u32> = entries.iter().filter_map(|e| e.pid).collect();
-    if unique_pids.is_empty() {
+    let pids: HashSet<u32> = entries.iter().filter_map(|e| e.pid).collect();
+    if pids.is_empty() {
         return;
     }
-
-    // Read /proc entries once per PID. A single PID can listen on many ports
-    // (a reverse proxy, for example), and the previous implementation paid
-    // those syscalls per-entry.
-    let mut info: HashMap<u32, (String, String, bool)> = HashMap::with_capacity(unique_pids.len());
-    for pid in &unique_pids {
-        let cwd = read_cwd_proc(*pid);
-        let cmdline = read_cmdline_proc(*pid);
-        let user_launched = read_user_launched_proc(*pid);
-        info.insert(*pid, (cwd, cmdline, user_launched));
+    let mut map: HashMap<u32, String> = HashMap::with_capacity(pids.len());
+    for pid in &pids {
+        map.insert(*pid, read_cmdline_proc(*pid));
     }
-
     for e in entries.iter_mut() {
-        if let Some(pid) = e.pid {
-            if let Some((cwd, cmdline, user_launched)) = info.get(&pid) {
-                e.cwd = cwd.clone();
-                e.cmdline = cmdline.clone();
-                e.user_launched = *user_launched;
-            }
+        if let Some(pid) = e.pid
+            && let Some(cmd) = map.get(&pid)
+        {
+            e.cmdline = cmd.clone();
         }
     }
 }
@@ -1467,10 +1622,10 @@ fn enrich_parent_info(entries: &mut [Entry]) {
         let s = String::from_utf8_lossy(&output.stdout);
         for line in s.lines() {
             let mut it = line.split_whitespace();
-            if let (Some(p), Some(pp)) = (it.next(), it.next()) {
-                if let (Ok(p), Ok(pp)) = (p.parse::<u32>(), pp.parse::<u32>()) {
-                    ppid_of.insert(p, pp);
-                }
+            if let (Some(p), Some(pp)) = (it.next(), it.next())
+                && let (Ok(p), Ok(pp)) = (p.parse::<u32>(), pp.parse::<u32>())
+            {
+                ppid_of.insert(p, pp);
             }
         }
     }
@@ -1505,40 +1660,28 @@ fn enrich_parent_info(entries: &mut [Entry]) {
     }
 
     for e in entries.iter_mut() {
-        if let Some(pid) = e.pid {
-            if let Some(&ppid) = ppid_of.get(&pid) {
-                let cmd = cmd_of
-                    .get(&ppid)
-                    .filter(|c| !c.is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| "?".to_string());
-                e.parent = Some((ppid, cmd));
-            }
+        if let Some(pid) = e.pid
+            && let Some(&ppid) = ppid_of.get(&pid)
+        {
+            let cmd = cmd_of
+                .get(&ppid)
+                .filter(|c| !c.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "?".to_string());
+            e.parent = Some((ppid, cmd));
         }
     }
 }
 
+// macOS pass 1: user_launched only, via one batched `ps` (tty + comm). BSD ps
+// uses "??" to mean "no controlling tty".
 #[cfg(target_os = "macos")]
-fn enrich_process_info(entries: &mut [Entry]) {
-    for e in entries.iter_mut() {
-        if e.pid.is_none() {
-            e.cwd = "-".to_string();
-            e.cmdline = "-".to_string();
-        }
-    }
-
-    let unique_pids: HashSet<u32> = entries.iter().filter_map(|e| e.pid).collect();
-    if unique_pids.is_empty() {
+fn enrich_user_launched(entries: &mut [Entry]) {
+    let pids: HashSet<u32> = entries.iter().filter_map(|e| e.pid).collect();
+    if pids.is_empty() {
         return;
     }
-    let pid_list = unique_pids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-
-    // ps pass 1: tty + comm (exe path) per pid.
-    // BSD ps uses "??" to mean "no controlling tty".
+    let pid_list = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
     let mut tty_exe: HashMap<u32, (bool, String)> = HashMap::new();
     if let Ok(output) = Command::new("ps")
         .args(["-ww", "-o", "pid=,tty=,comm=", "-p", &pid_list])
@@ -1561,30 +1704,28 @@ fn enrich_process_info(entries: &mut [Entry]) {
             tty_exe.insert(pid, (has_tty, basename));
         }
     }
-
-    // ps pass 2: full command line per pid.
-    let mut cmdline_map: HashMap<u32, String> = HashMap::new();
-    if let Ok(output) = Command::new("ps")
-        .args(["-ww", "-o", "pid=,command=", "-p", &pid_list])
-        .output()
-    {
-        let s = String::from_utf8_lossy(&output.stdout);
-        for line in s.lines() {
-            let trimmed = line.trim_start();
-            let Some(sp) = trimmed.find(char::is_whitespace) else {
-                continue;
-            };
-            let (pid_s, rest) = trimmed.split_at(sp);
-            let Ok(pid) = pid_s.parse::<u32>() else {
-                continue;
-            };
-            let cmd = rest.trim();
-            let value = if cmd.is_empty() { "-".to_string() } else { cmd.to_string() };
-            cmdline_map.insert(pid, value);
+    for e in entries.iter_mut() {
+        if let Some(pid) = e.pid
+            && let Some((has_tty, exe)) = tty_exe.get(&pid)
+        {
+            e.user_launched = *has_tty || is_interpreter_exe(exe);
         }
     }
+}
 
-    // lsof pass: cwd per pid, batched.
+// macOS pass 2: cwd via one batched lsof, after the default-mode filter.
+#[cfg(target_os = "macos")]
+fn enrich_cwd(entries: &mut [Entry]) {
+    for e in entries.iter_mut() {
+        if e.pid.is_none() {
+            e.cwd = "-".to_string();
+        }
+    }
+    let pids: HashSet<u32> = entries.iter().filter_map(|e| e.pid).collect();
+    if pids.is_empty() {
+        return;
+    }
+    let pid_list = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
     let mut cwd_map: HashMap<u32, String> = HashMap::new();
     if let Ok(output) = Command::new("lsof")
         .args(["-a", "-p", &pid_list, "-d", "cwd", "-Fn"])
@@ -1610,18 +1751,53 @@ fn enrich_process_info(entries: &mut [Entry]) {
             }
         }
     }
-
     for e in entries.iter_mut() {
-        if let Some(pid) = e.pid {
-            e.cwd = cwd_map.get(&pid).cloned().unwrap_or_else(|| "?".to_string());
-            e.cmdline = cmdline_map
-                .get(&pid)
-                .cloned()
-                .unwrap_or_else(|| "?".to_string());
-            e.user_launched = tty_exe
-                .get(&pid)
-                .map(|(has_tty, exe)| *has_tty || is_interpreter_exe(exe))
-                .unwrap_or(false);
+        if let Some(pid) = e.pid
+            && let Some(cwd) = cwd_map.get(&pid)
+        {
+            e.cwd = cwd.clone();
+        }
+    }
+}
+
+// macOS pass 3 (info mode only): full command line via one batched `ps`.
+#[cfg(target_os = "macos")]
+fn enrich_cmdline(entries: &mut [Entry]) {
+    for e in entries.iter_mut() {
+        if e.pid.is_none() {
+            e.cmdline = "-".to_string();
+        }
+    }
+    let pids: HashSet<u32> = entries.iter().filter_map(|e| e.pid).collect();
+    if pids.is_empty() {
+        return;
+    }
+    let pid_list = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let mut cmdline_map: HashMap<u32, String> = HashMap::new();
+    if let Ok(output) = Command::new("ps")
+        .args(["-ww", "-o", "pid=,command=", "-p", &pid_list])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&output.stdout);
+        for line in s.lines() {
+            let trimmed = line.trim_start();
+            let Some(sp) = trimmed.find(char::is_whitespace) else {
+                continue;
+            };
+            let (pid_s, rest) = trimmed.split_at(sp);
+            let Ok(pid) = pid_s.parse::<u32>() else {
+                continue;
+            };
+            let cmd = rest.trim();
+            let value = if cmd.is_empty() { "-".to_string() } else { cmd.to_string() };
+            cmdline_map.insert(pid, value);
+        }
+    }
+    for e in entries.iter_mut() {
+        if let Some(pid) = e.pid
+            && let Some(cmd) = cmdline_map.get(&pid)
+        {
+            e.cmdline = cmd.clone();
         }
     }
 }
@@ -1666,15 +1842,20 @@ fn enrich_local_stats(entries: &mut [Entry]) {
         let Ok(pid) = parts[0].parse::<u32>() else {
             continue;
         };
+        let cpu_pct = parts[1].parse::<f64>().ok();
         let cpu = format!("{}%", parts[1]);
         let rss_kb: u64 = parts[2].parse().unwrap_or(0);
-        let mem = format_mem(rss_kb * 1024);
+        let mem_bytes = rss_kb * 1024;
+        let mem = format_mem(mem_bytes);
         let (threads, etime_idx, user_idx) = if cfg!(target_os = "macos") {
             (None::<u32>, 3usize, 4usize)
         } else {
             (parts[3].parse::<u32>().ok(), 4usize, 5usize)
         };
-        let uptime = format_etime(parts[etime_idx]);
+        let uptime_secs = etime_to_secs(parts[etime_idx]);
+        let uptime = uptime_secs
+            .map(format_uptime)
+            .unwrap_or_else(|| parts[etime_idx].to_string());
         let user = Some(parts[user_idx].to_string());
         map.insert(
             pid,
@@ -1682,18 +1863,20 @@ fn enrich_local_stats(entries: &mut [Entry]) {
                 cpu,
                 mem,
                 uptime,
+                cpu_pct,
+                mem_bytes: Some(mem_bytes),
+                uptime_secs,
                 threads,
                 user,
             },
         );
     }
     for e in entries.iter_mut() {
-        if e.docker.is_none() {
-            if let Some(pid) = e.pid {
-                if let Some(s) = map.get(&pid) {
-                    e.stats = s.clone();
-                }
-            }
+        if e.docker.is_none()
+            && let Some(pid) = e.pid
+            && let Some(s) = map.get(&pid)
+        {
+            e.stats = s.clone();
         }
     }
 }
@@ -1760,7 +1943,7 @@ fn enrich_docker_stats(entries: &mut [Entry], include_cpu_mem: bool) {
         }
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut map: HashMap<String, (String, String)> = HashMap::new();
+    let mut map: HashMap<String, (String, Option<f64>, String, Option<u64>)> = HashMap::new();
     for line in stdout.lines() {
         let parts: Vec<&str> = line.splitn(3, '\t').collect();
         if parts.len() < 3 {
@@ -1768,22 +1951,46 @@ fn enrich_docker_stats(entries: &mut [Entry], include_cpu_mem: bool) {
         }
         let name = parts[0].to_string();
         let cpu = parts[1].to_string();
+        let cpu_pct = parts[1].trim_end_matches('%').parse::<f64>().ok();
         let mem = parts[2]
             .split('/')
             .next()
             .unwrap_or("-")
             .trim()
             .to_string();
-        map.insert(name, (cpu, mem));
+        let mem_bytes = parse_size(&mem);
+        map.insert(name, (cpu, cpu_pct, mem, mem_bytes));
     }
     for e in entries.iter_mut() {
-        if let Some(d) = &e.docker {
-            if let Some((cpu, mem)) = map.get(&d.name) {
-                e.stats.cpu = cpu.clone();
-                e.stats.mem = mem.clone();
-            }
+        if let Some(d) = &e.docker
+            && let Some((cpu, cpu_pct, mem, mem_bytes)) = map.get(&d.name)
+        {
+            e.stats.cpu = cpu.clone();
+            e.stats.cpu_pct = *cpu_pct;
+            e.stats.mem = mem.clone();
+            e.stats.mem_bytes = *mem_bytes;
         }
     }
+}
+
+// Parse a docker stats size like "123.4MiB" into bytes. Docker uses 1024-based
+// units (KiB/MiB/GiB/TiB); a bare number is bytes.
+fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let split = s
+        .find(|c: char| c.is_ascii_alphabetic())
+        .unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let value: f64 = num.trim().parse().ok()?;
+    let mult: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kib" | "kb" => 1024,
+        "mib" | "mb" => 1024 * 1024,
+        "gib" | "gb" => 1024 * 1024 * 1024,
+        "tib" | "tb" => 1024 * 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    Some((value * mult as f64) as u64)
 }
 
 fn format_mem(bytes: u64) -> String {
@@ -1801,23 +2008,28 @@ fn format_mem(bytes: u64) -> String {
     }
 }
 
-fn format_etime(et: &str) -> String {
+// ps etime ("[[DD-]hh:]mm:ss") to seconds. None when the shape is unrecognized,
+// in which case the caller keeps the raw string for display.
+fn etime_to_secs(et: &str) -> Option<u64> {
     let (days, rest) = match et.split_once('-') {
-        Some((d, r)) => (d.parse::<u64>().unwrap_or(0), r),
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
         None => (0, et),
     };
     let parts: Vec<&str> = rest.split(':').collect();
     let (h, m, s): (u64, u64, u64) = match parts.len() {
         3 => (
-            parts[0].parse().unwrap_or(0),
-            parts[1].parse().unwrap_or(0),
-            parts[2].parse().unwrap_or(0),
+            parts[0].parse().ok()?,
+            parts[1].parse().ok()?,
+            parts[2].parse().ok()?,
         ),
-        2 => (0, parts[0].parse().unwrap_or(0), parts[1].parse().unwrap_or(0)),
-        1 => (0, 0, parts[0].parse().unwrap_or(0)),
-        _ => return et.to_string(),
+        2 => (0, parts[0].parse().ok()?, parts[1].parse().ok()?),
+        1 => (0, 0, parts[0].parse().ok()?),
+        _ => return None,
     };
-    let total = days * 86400 + h * 3600 + m * 60 + s;
+    Some(days * 86400 + h * 3600 + m * 60 + s)
+}
+
+fn format_uptime(total: u64) -> String {
     if total >= 86400 {
         format!("{}d{}h", total / 86400, (total % 86400) / 3600)
     } else if total >= 3600 {
@@ -1875,10 +2087,11 @@ fn maybe_print_update_notice() {
         let mut lines = s.lines();
         let ts_line = lines.next().unwrap_or("").trim();
         let ver_line = lines.next().unwrap_or("").trim();
-        if let (Ok(ts), Some(now)) = (ts_line.parse::<u64>(), unix_now()) {
-            if now >= ts && now - ts < UPDATE_CACHE_TTL_SECS {
-                cache_fresh = true;
-            }
+        if let (Ok(ts), Some(now)) = (ts_line.parse::<u64>(), unix_now())
+            && now >= ts
+            && now - ts < UPDATE_CACHE_TTL_SECS
+        {
+            cache_fresh = true;
         }
         if !ver_line.is_empty() && version_gt(ver_line, current) {
             latest = Some(ver_line.to_string());
@@ -1989,7 +2202,14 @@ fn version_gt(a: &str, b: &str) -> bool {
             .map(|s| s.parse::<u32>().unwrap_or(0))
             .collect()
     }
-    parse(a) > parse(b)
+    let mut pa = parse(a);
+    let mut pb = parse(b);
+    // Pad to equal length: a bare lexicographic Vec comparison treats
+    // [0,9] < [0,9,0], which would report a phantom update from 0.9 to 0.9.0.
+    let len = pa.len().max(pb.len());
+    pa.resize(len, 0);
+    pb.resize(len, 0);
+    pa > pb
 }
 
 fn spawn_update_cache_refresh(cache_path: &std::path::Path) {
@@ -2114,12 +2334,10 @@ fn shorten_path(s: &str, home: Option<&str>) -> String {
     s.to_string()
 }
 
-fn print_info(entries: &[Entry], ports: &[u32]) -> i32 {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-
-    // Report each requested port that has no listener, the way `kill` does. A single
-    // "(no matching port found)" hid which port of `lport info 5432 59321` was empty.
+// Report each requested port that has no listener, the way `kill` does. A single
+// "(no matching port found)" hid which port of `lport info 5432 59321` was empty.
+// Returns 1 when anything missed.
+fn report_missing_ports(entries: &[Entry], ports: &[u32]) -> i32 {
     let mut missing = false;
     for &port in ports {
         if !entries.iter().any(|e| e.port == port) {
@@ -2127,6 +2345,14 @@ fn print_info(entries: &[Entry], ports: &[u32]) -> i32 {
             missing = true;
         }
     }
+    if missing { 1 } else { 0 }
+}
+
+fn print_info(entries: &[Entry], ports: &[u32]) -> i32 {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    let code = report_missing_ports(entries, ports);
 
     // Soft writes: `info` owes the caller an exit code (a missing port is 1), and exiting
     // 0 on a closed pipe would silently break that contract. There is nothing to gain from
@@ -2145,7 +2371,7 @@ fn print_info(entries: &[Entry], ports: &[u32]) -> i32 {
             outln_soft!(out, "  {:<width$}  {}", label, value, width = label_w);
         }
     }
-    if missing { 1 } else { 0 }
+    code
 }
 
 fn local_info_rows(e: &Entry) -> Vec<(&'static str, String)> {
@@ -2195,9 +2421,9 @@ fn docker_info_rows(e: &Entry, d: &DockerInfo) -> Vec<(&'static str, String)> {
     rows
 }
 
-fn print_table(entries: &[Entry], dev_mode: bool) {
+fn print_table(entries: &[Entry], dev_mode: bool, group_headers: bool) {
     let headers: &[&str] = &[
-        "PROTO", "PORT", "PID", "PROCESS", "JOB", "CPU", "MEM", "UPTIME",
+        "PROTO", "PORT", "ADDR", "PID", "PROCESS", "JOB", "CPU", "MEM", "UPTIME",
     ];
 
     let home = std::env::var("HOME").ok();
@@ -2212,6 +2438,7 @@ fn print_table(entries: &[Entry], dev_mode: bool) {
             vec![
                 e.proto.to_string(),
                 e.port.to_string(),
+                nz(&e.addr),
                 e.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".to_string()),
                 process,
                 job,
@@ -2240,9 +2467,18 @@ fn print_table(entries: &[Entry], dev_mode: bool) {
             .join("  ")
     };
     let stdout = io::stdout();
+    let tty = stdout.is_terminal();
     let mut out = stdout.lock();
+    // Bold header / group labels on a TTY only; piped output stays plain.
+    let bold = |s: String| -> String {
+        if tty {
+            format!("\x1b[1m{}\x1b[0m", s)
+        } else {
+            s
+        }
+    };
     let header_cells: Vec<String> = headers.iter().map(|s| s.to_string()).collect();
-    outln!(out, "{}", fmt_row(&header_cells));
+    outln!(out, "{}", bold(fmt_row(&header_cells)));
     let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
     outln!(out, "{}", sep.join("  "));
     // Every docker block (whether the group has one row or many) gets the
@@ -2250,6 +2486,8 @@ fn print_table(entries: &[Entry], dev_mode: bool) {
     // as a distinct block from neighbouring rows. Group key is the compose
     // project label if present, else the container name. Local rows stay
     // compact and are never given a separator among themselves.
+    // Suppressed under `--sort`, where rows are ordered globally and a block's
+    // rows may not be adjacent — a repeated header would mislead.
     let mut prev_docker_group: Option<&str> = None;
     for (i, (e, row)) in entries.iter().zip(rows.iter()).enumerate() {
         let cur_docker_group: Option<&str> = if e.docker.is_some() {
@@ -2257,12 +2495,12 @@ fn print_table(entries: &[Entry], dev_mode: bool) {
         } else {
             None
         };
-        if cur_docker_group.is_some() && cur_docker_group != prev_docker_group {
+        if group_headers && cur_docker_group.is_some() && cur_docker_group != prev_docker_group {
             if i > 0 {
                 outln!(out, "");
             }
             if let Some(name) = cur_docker_group {
-                outln!(out, "[ {} ]", name);
+                outln!(out, "{}", bold(format!("[ {} ]", name)));
             }
         }
         outln!(out, "{}", fmt_row(row));
@@ -2275,5 +2513,271 @@ fn print_table(entries: &[Entry], dev_mode: bool) {
         } else {
             eprintln!("\n(no user servers to display — run `lport --dev` to see everything)");
         }
+    }
+}
+
+// ================================================================
+// Tests — pure functions only; nothing here spawns processes or
+// touches /proc, so the suite runs anywhere.
+// ================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ---- port / address parsing ------------------------------------
+
+    #[test]
+    fn port_range_single_and_range() {
+        assert_eq!(parse_port_range("80"), Some((80, 80)));
+        assert_eq!(parse_port_range("80-82"), Some((80, 82)));
+        assert_eq!(parse_port_range(""), None);
+        assert_eq!(parse_port_range("abc"), None);
+        assert_eq!(parse_port_range("80-"), None);
+        assert_eq!(parse_port_range("-82"), None);
+    }
+
+    #[test]
+    fn bind_addr_splits_host_and_port() {
+        assert_eq!(split_bind_addr("0.0.0.0:8080"), "0.0.0.0");
+        assert_eq!(split_bind_addr("[::]:8080"), "::");
+        assert_eq!(split_bind_addr("*:5353"), "*");
+        assert_eq!(split_bind_addr("127.0.0.1:3101"), "127.0.0.1");
+        // Scope suffix (link-local binds) is dropped for matching...
+        assert_eq!(split_bind_addr("0.0.0.0%virbr0:67"), "0.0.0.0");
+        assert_eq!(split_bind_addr("[fe80::1%eth0]:8080"), "fe80::1");
+        // ...but kept for display.
+        assert_eq!(display_bind_addr("0.0.0.0%virbr0:67"), "0.0.0.0%virbr0");
+        assert_eq!(display_bind_addr("[::]:8080"), "::");
+    }
+
+    #[test]
+    fn wildcard_and_normalized_addrs() {
+        for a in ["", "0.0.0.0", "::", "*"] {
+            assert!(is_wildcard_addr(a), "{a} should be wildcard");
+        }
+        assert!(!is_wildcard_addr("127.0.0.1"));
+        assert_eq!(normalize_addr("::ffff:127.0.0.1"), "127.0.0.1");
+        assert_eq!(normalize_addr("127.0.0.1"), "127.0.0.1");
+    }
+
+    #[test]
+    fn ip_matching_respects_stack_and_wildcards() {
+        // wildcard publish claims any listener on the port
+        assert!(ip_matches("0.0.0.0", "127.0.0.1"));
+        assert!(ip_matches("::", "[::1]".trim_start_matches('[').trim_end_matches(']')));
+        // v4 publish must not claim a v6 listener and vice versa
+        assert!(!ip_matches("0.0.0.0", "::"));
+        assert!(!ip_matches("::", "0.0.0.0"));
+        // exact match, and v4-mapped v6 equals plain v4
+        assert!(ip_matches("127.0.0.1", "127.0.0.1"));
+        assert!(ip_matches("::ffff:127.0.0.1", "127.0.0.1"));
+        // a specific publish does not claim a different address
+        assert!(!ip_matches("192.168.1.10", "127.0.0.1"));
+        // lsof's "*" carries no stack info
+        assert!(ip_matches("*", "127.0.0.1"));
+        assert!(ip_matches("127.0.0.1", "*"));
+    }
+
+    // parse_users only exists on Linux (it parses `ss` output).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ss_users_field_parses_comms_with_spaces_and_quotes() {
+        let s = "users:((\"nginx\",pid=123,fd=6),(\"nginx\",pid=124,fd=7))";
+        assert_eq!(
+            parse_users(s),
+            vec![("nginx".to_string(), 123), ("nginx".to_string(), 124)]
+        );
+        // comm containing a space and an open paren (seen in the wild: "next-server (v1")
+        let s = "users:((\"next-server (v1\",pid=99,fd=5))";
+        assert_eq!(parse_users(s), vec![("next-server (v1".to_string(), 99)]);
+        assert!(parse_users("").is_empty());
+        assert!(parse_users("users:()").is_empty());
+    }
+
+    // ---- formatting -------------------------------------------------
+
+    #[test]
+    fn mem_formatting() {
+        assert_eq!(format_mem(0), "0B");
+        assert_eq!(format_mem(512), "512B");
+        assert_eq!(format_mem(2048), "2K");
+        assert_eq!(format_mem(5 * 1024 * 1024), "5M");
+        assert_eq!(format_mem(2 * 1024 * 1024 * 1024), "2.0G");
+    }
+
+    #[test]
+    fn etime_parsing_and_display() {
+        assert_eq!(etime_to_secs("45"), Some(45));
+        assert_eq!(etime_to_secs("05:32"), Some(332));
+        assert_eq!(etime_to_secs("01:02:03"), Some(3723));
+        assert_eq!(etime_to_secs("9-06:00:00"), Some(9 * 86400 + 6 * 3600));
+        assert_eq!(etime_to_secs("garbage:extra:fields:here"), None);
+        assert_eq!(format_uptime(45), "45s");
+        assert_eq!(format_uptime(332), "5m32s");
+        assert_eq!(format_uptime(3723), "1h2m");
+        assert_eq!(format_uptime(9 * 86400 + 6 * 3600), "9d6h");
+    }
+
+    #[test]
+    fn docker_size_parsing() {
+        assert_eq!(parse_size("123B"), Some(123));
+        assert_eq!(parse_size("2KiB"), Some(2048));
+        assert_eq!(parse_size("189MiB"), Some(189 * 1024 * 1024));
+        assert_eq!(parse_size("2.0GiB"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_size("1.5TiB"), Some((1.5 * 1024f64.powi(4)) as u64));
+        assert_eq!(parse_size("-"), None);
+        assert_eq!(parse_size("abc"), None);
+    }
+
+    #[test]
+    fn display_width_counts_cjk_and_emoji_double() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("프로젝트"), 8);
+        assert_eq!(display_width("a😀b"), 4);
+        assert_eq!(display_width("~/프로젝트/데모"), 2 + 8 + 1 + 4);
+    }
+
+    #[test]
+    fn path_shortening_only_touches_home() {
+        let home = Some("/home/bch");
+        assert_eq!(shorten_path("/home/bch", home), "~");
+        assert_eq!(shorten_path("/home/bch/proj", home), "~/proj");
+        assert_eq!(shorten_path("/etc/nginx", home), "/etc/nginx");
+        assert_eq!(shorten_path("", home), "");
+        assert_eq!(shorten_path("-", home), "-");
+        assert_eq!(shorten_path("/home/bch2/x", home), "/home/bch2/x");
+        assert_eq!(shorten_path("/home/bch/proj", None), "/home/bch/proj");
+    }
+
+    // ---- version comparison -----------------------------------------
+
+    #[test]
+    fn version_comparison_pads_and_strips() {
+        assert!(version_gt("0.10.0", "0.9.0"));
+        assert!(version_gt("1.0.0", "0.99.99"));
+        assert!(version_gt("v0.10.0", "0.9.0"));
+        assert!(!version_gt("0.9.0", "0.9.0"));
+        // padding: 0.9.0 is NOT newer than 0.9
+        assert!(!version_gt("0.9.0", "0.9"));
+        assert!(!version_gt("0.9", "0.9.0"));
+        // pre-release suffix stripped: 0.9.0-beta == 0.9.0, not greater
+        assert!(!version_gt("0.9.0-beta", "0.9.0"));
+        assert!(version_gt("0.9.1", "0.9.0-beta"));
+    }
+
+    // ---- argument parsing -------------------------------------------
+
+    #[test]
+    fn parse_dashboard_defaults_and_dev() {
+        let cli = parse_args(&args(&[])).unwrap();
+        assert_eq!(cli.mode, Mode::Dashboard { dev: false });
+        assert_eq!(cli.sort, None);
+        let cli = parse_args(&args(&["--dev"])).unwrap();
+        assert_eq!(cli.mode, Mode::Dashboard { dev: true });
+    }
+
+    #[test]
+    fn parse_sort_flag_in_any_position() {
+        let cli = parse_args(&args(&["--sort", "mem"])).unwrap();
+        assert_eq!(cli.mode, Mode::Dashboard { dev: false });
+        assert_eq!(cli.sort, Some(SortKey::Mem));
+        let cli = parse_args(&args(&["--dev", "--sort", "cpu"])).unwrap();
+        assert_eq!(cli.mode, Mode::Dashboard { dev: true });
+        assert_eq!(cli.sort, Some(SortKey::Cpu));
+    }
+
+    #[test]
+    fn parse_sort_rejects_bad_key_or_missing_value() {
+        assert!(parse_args(&args(&["--sort"])).unwrap_err().contains("requires a key"));
+        assert!(parse_args(&args(&["--sort", "bogus"]))
+            .unwrap_err()
+            .contains("invalid sort key 'bogus'"));
+    }
+
+    #[test]
+    fn parse_info_shorthand_and_subcommand() {
+        let cli = parse_args(&args(&["8080"])).unwrap();
+        assert_eq!(cli.mode, Mode::Info { ports: vec![8080] });
+        let cli = parse_args(&args(&["info", "8080", "5432"])).unwrap();
+        assert_eq!(cli.mode, Mode::Info { ports: vec![8080, 5432] });
+        // out-of-range port is not a shorthand and not a valid port
+        assert!(parse_args(&args(&["99999"])).is_err());
+        assert!(parse_args(&args(&["info", "abc"])).unwrap_err().contains("invalid port 'abc'"));
+        assert!(parse_args(&args(&["info"])).unwrap_err().contains("at least one port"));
+    }
+
+    #[test]
+    fn parse_kill_flags_and_errors() {
+        let cli = parse_args(&args(&["kill", "3000"])).unwrap();
+        assert_eq!(
+            cli.mode,
+            Mode::Kill { ports: vec![3000], force: false, yes: false }
+        );
+        let cli = parse_args(&args(&["kill", "-9", "-y", "3000", "8080"])).unwrap();
+        assert_eq!(
+            cli.mode,
+            Mode::Kill { ports: vec![3000, 8080], force: true, yes: true }
+        );
+        assert!(parse_args(&args(&["kill"])).unwrap_err().contains("at least one port"));
+        assert!(parse_args(&args(&["kill", "abc"])).unwrap_err().contains("invalid port 'abc'"));
+        // --sort is meaningless (and refused) for kill
+        assert!(parse_args(&args(&["kill", "3000", "--sort", "mem"]))
+            .unwrap_err()
+            .contains("--sort"));
+    }
+
+    #[test]
+    fn parse_unknown_argument() {
+        assert!(parse_args(&args(&["--bogus"]))
+            .unwrap_err()
+            .contains("unknown argument '--bogus'"));
+    }
+
+    // ---- sorting ------------------------------------------------------
+
+    fn entry(port: u32, pid: Option<u32>, cpu: Option<f64>, mem: Option<u64>, up: Option<u64>) -> Entry {
+        Entry {
+            proto: "tcp",
+            port,
+            pid,
+            process: format!("p{port}"),
+            addr: "0.0.0.0".to_string(),
+            cwd: String::new(),
+            cmdline: String::new(),
+            parent: None,
+            docker: None,
+            stats: Stats {
+                cpu_pct: cpu,
+                mem_bytes: mem,
+                uptime_secs: up,
+                ..Stats::default()
+            },
+            user_launched: false,
+        }
+    }
+
+    #[test]
+    fn sort_by_mem_largest_first_unknowns_last() {
+        let mut v = vec![
+            entry(1, Some(1), None, None, None),
+            entry(2, Some(2), None, Some(100), None),
+            entry(3, Some(3), None, Some(900), None),
+        ];
+        sort_entries(&mut v, SortKey::Mem);
+        let ports: Vec<u32> = v.iter().map(|e| e.port).collect();
+        assert_eq!(ports, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn sort_by_port_ascending() {
+        let mut v = vec![entry(8080, None, None, None, None), entry(80, None, None, None, None)];
+        sort_entries(&mut v, SortKey::Port);
+        let ports: Vec<u32> = v.iter().map(|e| e.port).collect();
+        assert_eq!(ports, vec![80, 8080]);
     }
 }
